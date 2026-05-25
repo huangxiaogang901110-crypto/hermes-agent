@@ -62,6 +62,9 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.wecom_content_injector import inject_text_attachments
+from gateway.platforms.wecom_cache_index import (
+    extract_doc_id_from_url, find_by_doc_id, find_by_context, write_sidecar,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -187,6 +190,12 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._device_id = uuid.uuid4().hex
         self._last_chat_req_ids: Dict[str, str] = {}
+
+        # Sidecar context: temporary storage for current message sender/chat/msgid,
+        # set in _on_message before media extraction, consumed by _cache_media.
+        self._current_msgid: str = ""
+        self._current_sender: str = ""
+        self._current_chat_id: str = ""
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -511,6 +520,11 @@ class WeComAdapter(BasePlatformAdapter):
             logger.debug("[%s] DM sender %s blocked by policy", self.name, sender_id)
             return
 
+        # Store current message context for sidecar index (consumed by _cache_media)
+        self._current_msgid = msg_id
+        self._current_sender = sender_id
+        self._current_chat_id = chat_id
+
         # Cache the inbound req_id after policy checks so proactive sends to
         # this chat can fall back to APP_CMD_RESPONSE (required for groups —
         # WeCom AI Bots cannot initiate APP_CMD_SEND in group chats).
@@ -677,6 +691,11 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _inject_and_handle(self, event: MessageEvent) -> None:
         """注入文本附件内容后分发。读取失败不影响原消息。"""
+        # Resolve doc.weixin.qq.com URLs in text to cached .docx files
+        resolved_paths = self._resolve_doc_urls(event)
+        if resolved_paths:
+            event.media_urls = list(event.media_urls) + resolved_paths
+
         try:
             injected = inject_text_attachments(event.media_urls)
         except Exception:
@@ -687,6 +706,37 @@ class WeComAdapter(BasePlatformAdapter):
             event.text = (event.text or "") + injected
 
         await self.handle_message(event)
+
+    def _resolve_doc_urls(self, event: MessageEvent) -> List[str]:
+        """从 event.text 中提取 doc.weixin.qq.com URL，查找侧车索引返回缓存路径。"""
+        paths: List[str] = []
+        text = event.text or ""
+        # Find all doc.weixin.qq.com URLs in text
+        import re
+        urls = re.findall(r"https?://doc\.weixin\.qq\.com/doc/(w3_[A-Za-z0-9_]+)", text)
+        if not urls:
+            return paths
+
+        for doc_id in urls:
+            # 1) 精确 doc_id 匹配
+            cache_path = find_by_doc_id(doc_id)
+            if cache_path:
+                paths.append(cache_path)
+                logger.debug("[%s] sidecar exact match doc_id=%s → %s", self.name, doc_id, cache_path)
+                continue
+
+            # 2) 兜底：同 sender + 同 chat + 30min 唯一候选
+            sender = event.source.user_id if event.source else ""
+            chat_id = event.source.chat_id if event.source else ""
+            if sender and chat_id:
+                cache_path = find_by_context(sender, chat_id)
+                if cache_path:
+                    paths.append(cache_path)
+                    logger.debug("[%s] sidecar fallback match for %s/%s → %s", self.name, sender, chat_id, cache_path)
+                else:
+                    logger.debug("[%s] sidecar no match for doc_id=%s", self.name, doc_id)
+
+        return paths
 
     @staticmethod
     def _extract_text(body: Dict[str, Any]) -> Tuple[str, Optional[str]]:
@@ -844,7 +894,20 @@ class WeComAdapter(BasePlatformAdapter):
             return cache_audio_from_bytes(raw, ".amr"), "audio/amr"
 
         filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
-        return cache_document_from_bytes(raw, filename), content_type
+        cache_path = cache_document_from_bytes(raw, filename)
+        # Write sidecar index for appmsg/doc downloads so later doc.weixin.qq.com
+        # URL text messages can find the cached .docx content.
+        try:
+            write_sidecar(
+                cache_path=cache_path,
+                sender=self._current_sender,
+                chat_id=self._current_chat_id,
+                msgid=self._current_msgid,
+                source_url=url,
+            )
+        except Exception:
+            logger.debug("[%s] sidecar write failed for %s", self.name, cache_path, exc_info=True)
+        return cache_path, content_type
 
     @staticmethod
     def _decode_base64(data: str) -> bytes:
