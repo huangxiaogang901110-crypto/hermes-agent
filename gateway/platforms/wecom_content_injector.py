@@ -1,5 +1,5 @@
 """
-WeCom 附件内容自动注入 — Phase 2 (txt/md 纯文本).
+WeCom 附件内容自动注入 — Phase 2.5 (txt/md/docx 纯文本).
 
 在 MessageEvent 分发前自动读取 media_urls 中的纯文本文件内容，
 注入到 event.text 前缀。不影响图片/语音/普通文件链路。
@@ -10,9 +10,10 @@ WeCom 附件内容自动注入 — Phase 2 (txt/md 纯文本).
 from __future__ import annotations
 
 import logging
-import os
+import zipfile
 from pathlib import Path
 from typing import List
+from xml.etree import ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ TEXT_EXTENSIONS: set[str] = {
     ".json", ".yaml", ".yml",
     ".csv", ".xml",
     ".py", ".sh",
+    ".docx",  # 企微自动转长消息 → ZIP+XML → 标准库提取
 }
 
 # ── 限制 ──
@@ -37,6 +39,28 @@ def _is_text_file(path: Path) -> bool:
         return b"\x00" not in head
     except OSError:
         return False
+
+
+def _extract_docx_text(path: Path) -> str | None:
+    """从 .docx (ZIP+XML) 提取纯文本，零外部依赖。"""
+    try:
+        with zipfile.ZipFile(path) as z:
+            xml = z.read("word/document.xml")
+    except (zipfile.BadZipFile, KeyError, OSError):
+        return None
+
+    try:
+        NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        root = ET.fromstring(xml)
+        lines: list[str] = []
+        for p in root.iter(f"{{{NS}}}p"):
+            line = "".join(t.text or "" for t in p.iter(f"{{{NS}}}t"))
+            stripped = line.strip()
+            if stripped:
+                lines.append(stripped)
+        return "\n".join(lines) if lines else None
+    except ET.ParseError:
+        return None
 
 
 def _read_text_content(path: Path, max_bytes: int) -> str | None:
@@ -97,13 +121,15 @@ def inject_text_attachments(media_urls: List[str]) -> str | None:
             )
             continue
 
-        # 二进制检测
-        if not _is_text_file(path):
-            logger.debug("[wecom] 二进制文件跳过: %s", path.name)
-            continue
+        # 读取内容 — docx 走 ZIP/XML 提取，其余走纯文本
+        if ext == ".docx":
+            content = _extract_docx_text(path)
+        else:
+            if not _is_text_file(path):
+                logger.debug("[wecom] 二进制文件跳过: %s", path.name)
+                continue
+            content = _read_text_content(path, SINGLE_FILE_MAX_BYTES)
 
-        # 读取
-        content = _read_text_content(path, SINGLE_FILE_MAX_BYTES)
         if content is None:
             continue
 
