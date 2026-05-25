@@ -37,6 +37,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import time
 import uuid
 from datetime import datetime, timezone
@@ -60,6 +61,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms.wecom_content_injector import inject_text_attachments
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -67,6 +69,7 @@ from gateway.platforms.base import (
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    cache_audio_from_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -521,6 +524,51 @@ class WeComAdapter(BasePlatformAdapter):
             text = re.sub(r"^@\S+\s*", "", text).strip()
         media_urls, media_types = await self._extract_media(body)
         message_type = self._derive_message_type(body, text, media_types)
+
+        # ── Groq Whisper 语音转写（2026-05-12）──
+        # 企业微信语音消息 → 下载 AMR → ffmpeg 转 WAV → Groq Whisper 转写 → 替换 WeCom ASR
+        if message_type == MessageType.VOICE and media_urls:
+            amr_path = media_urls[0]
+            wav_path = ""
+            try:
+                script = os.path.expanduser("~/.hermes/profiles/me/bin/groq-whisper-transcribe.sh")
+                if os.path.isfile(script) and (shutil.which("ffmpeg") or shutil.which("ffprobe")):
+                    # 如果是 AMR 格式 → ffmpeg 转 WAV（Groq API 不支持 AMR）
+                    audio_path = amr_path
+                    if amr_path.lower().endswith(".amr") and shutil.which("ffmpeg"):
+                        wav_path = amr_path + ".groq.wav"
+                        convert = await asyncio.create_subprocess_exec(
+                            "ffmpeg", "-y", "-i", amr_path, "-ar", "16000", "-ac", "1",
+                            wav_path,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await asyncio.wait_for(convert.communicate(), timeout=10)
+                        if convert.returncode == 0 and os.path.isfile(wav_path):
+                            audio_path = wav_path
+                        else:
+                            audio_path = amr_path  # 转码失败，回退用原文件试试
+                    proc = await asyncio.create_subprocess_exec(
+                        "bash", script, audio_path,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                    if proc.returncode == 0 and stdout:
+                        groq_text = stdout.decode().strip()
+                        if groq_text:
+                            logger.info("[%s] Groq Whisper → %d chars", self.name, len(groq_text))
+                            text = groq_text
+            except Exception:
+                logger.debug("[%s] Groq Whisper fallback to WeCom ASR", self.name, exc_info=True)
+            finally:
+                # 清理临时 WAV
+                if wav_path and os.path.isfile(wav_path):
+                    try:
+                        os.unlink(wav_path)
+                    except OSError:
+                        pass
+
         has_reply_context = bool(reply_text and (text or media_urls))
 
         if not text and reply_text and not media_urls:
@@ -555,7 +603,7 @@ class WeComAdapter(BasePlatformAdapter):
         if message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
             self._enqueue_text_event(event)
         else:
-            await self.handle_message(event)
+            await self._inject_and_handle(event)
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles WeCom client-side splits)
@@ -622,10 +670,23 @@ class WeComAdapter(BasePlatformAdapter):
                 "[WeCom] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
-            await self.handle_message(event)
+            await self._inject_and_handle(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+
+    async def _inject_and_handle(self, event: MessageEvent) -> None:
+        """注入文本附件内容后分发。读取失败不影响原消息。"""
+        try:
+            injected = inject_text_attachments(event.media_urls)
+        except Exception:
+            logger.debug("[%s] 附件注入异常，跳过", self.name, exc_info=True)
+            injected = None
+
+        if injected:
+            event.text = (event.text or "") + injected
+
+        await self.handle_message(event)
 
     @staticmethod
     def _extract_text(body: Dict[str, Any]) -> Tuple[str, Optional[str]]:
@@ -696,11 +757,15 @@ class WeComAdapter(BasePlatformAdapter):
                 item_type = str(item.get("msgtype") or "").lower()
                 if item_type == "image" and isinstance(item.get("image"), dict):
                     refs.append(("image", item["image"]))
+                elif item_type == "voice" and isinstance(item.get("voice"), dict):
+                    refs.append(("voice", item["voice"]))
         else:
             if isinstance(body.get("image"), dict):
                 refs.append(("image", body["image"]))
             if msgtype == "file" and isinstance(body.get("file"), dict):
                 refs.append(("file", body["file"]))
+            if msgtype == "voice" and isinstance(body.get("voice"), dict):
+                refs.append(("voice", body["voice"]))
             # Handle appmsg (WeCom AI Bot attachments with PDF/Word/Excel)
             if msgtype == "appmsg" and isinstance(body.get("appmsg"), dict):
                 appmsg = body["appmsg"]
@@ -742,6 +807,9 @@ class WeComAdapter(BasePlatformAdapter):
                     logger.warning("[%s] Rejected non-image bytes: %s", self.name, exc)
                     return None
 
+            if kind == "voice":
+                return cache_audio_from_bytes(raw, ".amr"), "audio/amr"
+
             filename = str(media.get("filename") or media.get("name") or "wecom_file")
             return cache_document_from_bytes(raw, filename), mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
@@ -771,6 +839,9 @@ class WeComAdapter(BasePlatformAdapter):
             except ValueError as exc:
                 logger.warning("[%s] Rejected non-image bytes from %s: %s", self.name, url, exc)
                 return None
+
+        if kind == "voice":
+            return cache_audio_from_bytes(raw, ".amr"), "audio/amr"
 
         filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
         return cache_document_from_bytes(raw, filename), content_type
