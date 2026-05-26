@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPTS = Path.home() / ".hermes" / "profiles" / "me" / "memory" / "scripts"
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_SCRIPTS = _REPO_ROOT / "tools" / "memory"
+# Fallback: user-installed scripts path
+if not _SCRIPTS.is_dir():
+    _SCRIPTS = Path.home() / ".hermes" / "profiles" / "me" / "memory" / "scripts"
 _PYTHON = Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
 
 

@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 # ── import the plugin module (directory name has hyphens) ──────────────────
-_PLUGIN_DIR = Path.home() / ".hermes" / "plugins" / "hermes-memory-plugin"
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_PLUGIN_DIR = _REPO_ROOT / "plugins" / "hermes-memory"
+# Fallback: user-installed plugin path
+if not _PLUGIN_DIR.is_dir():
+    _PLUGIN_DIR = Path.home() / ".hermes" / "plugins" / "hermes-memory-plugin"
 _spec = importlib.util.spec_from_file_location(
     "hermes_memory_plugin",
     _PLUGIN_DIR / "__init__.py",

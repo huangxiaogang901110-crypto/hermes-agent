@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 # ── import validator functions from p3b_apply_pipeline ─────────────────────
-_PIPELINE = Path.home() / ".hermes" / "profiles" / "me" / "memory" / "scripts" / "p3b_apply_pipeline.py"
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_PIPELINE = _REPO_ROOT / "tools" / "memory" / "p3b_apply_pipeline.py"
+# Fallback: user-installed pipeline path
+if not _PIPELINE.is_file():
+    _PIPELINE = Path.home() / ".hermes" / "profiles" / "me" / "memory" / "scripts" / "p3b_apply_pipeline.py"
 _spec = importlib.util.spec_from_file_location("p3b", str(_PIPELINE))
 _mod = importlib.util.module_from_spec(_spec)
 sys.modules["p3b"] = _mod

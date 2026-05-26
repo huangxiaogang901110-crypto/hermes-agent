@@ -1,0 +1,5 @@
+name: hermes-memory-plugin
+version: 0.1.0
+description: "P1 minimal Hermes memory learning — active_lessons injection + event candidate recording"
+author: Hermes Agent
+kind: memory

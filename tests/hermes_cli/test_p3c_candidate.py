@@ -13,7 +13,11 @@ from pathlib import Path
 import pytest
 
 # ── paths ──────────────────────────────────────────────────────────────────
-_P3C = Path.home() / ".hermes" / "profiles" / "me" / "memory" / "scripts" / "p3c_apply_pipeline.py"
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_P3C = _REPO_ROOT / "tools" / "memory" / "p3c_apply_pipeline.py"
+# Fallback: user-installed pipeline path
+if not _P3C.is_file():
+    _P3C = Path.home() / ".hermes" / "profiles" / "me" / "memory" / "scripts" / "p3c_apply_pipeline.py"
 _PYTHON = str(Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python")
 
 
