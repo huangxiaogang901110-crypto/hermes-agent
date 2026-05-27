@@ -1,0 +1,7 @@
+name: skill-catalog
+version: 0.1.0
+description: "Plan A skill catalog — pre_llm_call keyword match → inject SKILL.md context. Max 2 per round."
+author: Hermes me
+kind: standalone
+hooks:
+  - pre_llm_call
