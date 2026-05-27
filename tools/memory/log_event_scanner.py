@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 # ── paths ──────────────────────────────────────────────────────────────────
+_SCRIPTS_DIR = Path(__file__).resolve().parent
 _DEFAULT_EVENTS_PATH = (
     Path.home() / ".hermes" / "profiles" / "me" / "memory" / "events" / "event_candidates.jsonl"
 )
@@ -371,11 +372,32 @@ def main():
             for c in candidates:
                 f.write(json.dumps(c, ensure_ascii=False) + "\n")
         print(f"\n[scanner] Wrote {len(candidates)} new event(s) to {output_path}")
+
+        # ── P5A: trigger shadow pipeline after new events ─────────────────
+        _trigger_shadow_pipeline_if_new(candidates)
     else:
         print(f"\n[scanner] DRY-RUN — no files written. Use --apply to write.")
         print(f"[scanner] Would write to: {output_path}")
 
     return 0
+
+
+def _trigger_shadow_pipeline_if_new(candidates: list) -> None:
+    """Trigger memory_pipeline shadow run if we found new non-sensitive candidates."""
+    new_count = sum(1 for c in candidates if not c.get("blocked_sensitive"))
+    if new_count == 0:
+        return
+    try:
+        pipeline = _SCRIPTS_DIR / "memory_pipeline.py"
+        if not pipeline.is_file():
+            return
+        subprocess.run(
+            [sys.executable, str(pipeline), "--reason", "log_scanner"],
+            capture_output=True, timeout=60,
+        )
+        print(f"[scanner] Shadow pipeline triggered for {new_count} new event(s)")
+    except Exception:
+        pass  # non-fatal
 
 
 if __name__ == "__main__":

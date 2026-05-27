@@ -16,6 +16,8 @@ import json
 import logging
 import os
 import re
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -300,11 +302,79 @@ def _record_candidate(
             session_id or "?", reason,
         )
 
+        # ── P5A: auto-trigger shadow pipeline ────────────────────────────
+        # Gate: only user_correction or assistant_failure events
+        if reason.startswith("user_correction:") or reason.startswith("assistant_failure:"):
+            _maybe_trigger_shadow_pipeline(reason)
+
     except Exception as exc:
         logger.warning(
             "[hermes-memory] post_llm_call recording failed: %s — path=%s",
             exc, _EVENT_CANDIDATES_PATH,
         )
+
+
+# ── P5A: shadow pipeline throttle ──────────────────────────────────────────
+_PIPELINE_PID_FILE = _MEMORY_DIR / ".pipeline_running"
+_PIPELINE_COOLDOWN_SEC = 30  # prevent back-to-back triggers
+
+
+def _maybe_trigger_shadow_pipeline(reason: str) -> None:
+    """Trigger memory_pipeline in shadow/dry-run mode after recording an event.
+
+    Gating:
+    - Throttle: skip if pipeline ran within _PIPELINE_COOLDOWN_SEC seconds.
+    - Lock: skip if another pipeline is already running (pid file).
+    - Failure here must NEVER impact the main reply.
+    """
+    try:
+        # ── throttle check ────────────────────────────────────────────
+        if _PIPELINE_PID_FILE.is_file():
+            try:
+                age = time.time() - _PIPELINE_PID_FILE.stat().st_mtime
+                if age < _PIPELINE_COOLDOWN_SEC:
+                    logger.debug(
+                        "[hermes-memory] pipeline cooldown active (%.0fs < %ds) — skip trigger",
+                        age, _PIPELINE_COOLDOWN_SEC,
+                    )
+                    return
+            except OSError:
+                pass
+
+        # Touch pid file to set cooldown
+        _PIPELINE_PID_FILE.write_text(str(os.getpid()))
+
+        # ── run pipeline shadow mode ──────────────────────────────────
+        pipeline_script = str(
+            Path(__file__).resolve().parent.parent.parent
+            / "tools" / "memory" / "memory_pipeline.py"
+        )
+        if not Path(pipeline_script).is_file():
+            logger.debug("[hermes-memory] pipeline script not found — skip trigger")
+            return
+
+        result = _run_subprocess(
+            [sys.executable, pipeline_script, "--reason", reason],
+            timeout=60,
+        )
+        logger.info(
+            "[hermes-memory] shadow pipeline triggered — reason=%s exit=%d",
+            reason, result.get("exit_code", -1),
+        )
+    except Exception as exc:
+        logger.debug("[hermes-memory] shadow pipeline trigger failed (non-fatal): %s", exc)
+
+
+def _run_subprocess(args: list, timeout: int = 60) -> dict:
+    """Run a subprocess, return {'exit_code': int, 'stdout': str}. Exception-safe."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(args, capture_output=True, text=True, timeout=timeout)
+        return {"exit_code": r.returncode, "stdout": r.stdout[:2000]}
+    except _sp.TimeoutExpired:
+        return {"exit_code": -1, "stdout": "timeout"}
+    except Exception:
+        return {"exit_code": -1, "stdout": "error"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

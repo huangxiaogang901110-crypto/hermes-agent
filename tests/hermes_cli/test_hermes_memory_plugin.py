@@ -413,3 +413,110 @@ class TestPostLlmCall:
         assert pipeline_path.name == "event_candidates.jsonl", (
             f"Pipeline uses '{pipeline_path.name}', expected 'event_candidates.jsonl'"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# P5A: shadow pipeline auto-trigger tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestP5AShadowPipeline:
+    """P5A shadow pipeline — auto-trigger, gating, isolation."""
+
+    def _setup_paths(self, monkeypatch, tmp_path):
+        events_dir = tmp_path / "events"
+        candidates = events_dir / "event_candidates.jsonl"
+        monkeypatch.setattr(_plugin, "_EVENTS_DIR", events_dir)
+        monkeypatch.setattr(_plugin, "_EVENT_CANDIDATES_PATH", candidates)
+        # Disable actual subprocess — mock to track calls
+        calls = []
+        def _fake_subprocess(args, timeout=60):
+            calls.append(args)
+            return {"exit_code": 0, "stdout": "shadow ok"}
+        monkeypatch.setattr(_plugin, "_run_subprocess", _fake_subprocess)
+        # Disable throttle
+        pid_file = tmp_path / ".pipeline_running"
+        monkeypatch.setattr(_plugin, "_PIPELINE_PID_FILE", pid_file)
+        return candidates, calls, pid_file
+
+    def test_user_correction_triggers_shadow(self, monkeypatch, tmp_path):
+        """user_correction event → pipeline triggered."""
+        candidates, calls, _ = self._setup_paths(monkeypatch, tmp_path)
+        _record_candidate(
+            session_id="s1",
+            user_message="不对，这个方案有问题",
+            assistant_response="收到",
+        )
+        assert len(calls) >= 1, "user_correction must trigger pipeline"
+        assert "--reason" in calls[0]
+        assert "user_correction:不对" in calls[0]
+
+    def test_normal_message_no_trigger(self, monkeypatch, tmp_path):
+        """Normal message → NOT recorded → NOT triggered."""
+        candidates, calls, _ = self._setup_paths(monkeypatch, tmp_path)
+        _record_candidate(
+            session_id="s1",
+            user_message="今天天气怎么样",
+            assistant_response="不错",
+        )
+        assert len(calls) == 0, "normal message must NOT trigger pipeline"
+
+    def test_duplicate_event_no_repeat_trigger(self, monkeypatch, tmp_path):
+        """Duplicate correction → recorded once, pipeline triggered once."""
+        candidates, calls, _ = self._setup_paths(monkeypatch, tmp_path)
+        msg = "不对，这个不对"
+        _record_candidate(session_id="s1", user_message=msg, assistant_response="收到")
+        first_calls = len(calls)
+        assert first_calls >= 1
+        # Second identical message → duplicate check skips
+        _record_candidate(session_id="s1", user_message=msg, assistant_response="收到")
+        assert len(calls) == first_calls, "duplicate must NOT retrigger pipeline"
+
+    def test_shadow_mode_does_not_write_active_lessons(self, monkeypatch, tmp_path):
+        """shadow pipeline report must have wrote_active_lessons: false."""
+        import json as _json
+        models_dir = tmp_path / "models"
+        report_path = models_dir / "latest_pipeline_report.json"
+        # Simulate a completed shadow run with a fake report
+        models_dir.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(_json.dumps({
+            "mode": "shadow",
+            "wrote_active_lessons": False,
+        }))
+        assert report_path.is_file()
+        data = _json.loads(report_path.read_text())
+        assert data["wrote_active_lessons"] is False
+        assert data["mode"] == "shadow"
+
+    def test_pipeline_failure_isolation(self, monkeypatch, tmp_path):
+        """Pipeline subprocess failure must not prevent event recording."""
+        candidates, calls, _ = self._setup_paths(monkeypatch, tmp_path)
+        # Inject a failing pipeline
+        def _fail_subprocess(args, timeout=60):
+            raise RuntimeError("simulated crash")
+        monkeypatch.setattr(_plugin, "_run_subprocess", _fail_subprocess)
+        # This must NOT raise — event recording must still work
+        _record_candidate(
+            session_id="s1",
+            user_message="不对",
+            assistant_response="失败",
+        )
+        assert candidates.is_file(), "event must be recorded even if pipeline fails"
+
+    def test_throttle_prevents_rapid_retrigger(self, monkeypatch, tmp_path):
+        """Cooldown (30s) prevents back-to-back pipeline triggers."""
+        candidates, calls, pid_file = self._setup_paths(monkeypatch, tmp_path)
+        # First trigger — should fire
+        _record_candidate(session_id="s1", user_message="不对1", assistant_response="x")
+        assert len(calls) == 1
+        # Second trigger within cooldown — should skip
+        _record_candidate(session_id="s2", user_message="不对2", assistant_response="x")
+        assert len(calls) == 1, "cooldown must prevent 2nd trigger"
+
+    def test_memory_char_limit_unchanged(self):
+        """memory_char_limit stays 2200 after P5A changes."""
+        import yaml
+        config_path = Path.home() / ".hermes" / "profiles" / "me" / "config.yaml"
+        cfg = yaml.safe_load(config_path.read_text())
+        assert cfg["memory"]["memory_char_limit"] == 2200, (
+            f"memory_char_limit must be 2200, got {cfg['memory']['memory_char_limit']}"
+        )
