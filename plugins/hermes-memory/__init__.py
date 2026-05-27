@@ -79,7 +79,43 @@ def _inject_active_lessons(*, session_id: str = "", **_kwargs) -> dict | None:
     stable and cache-friendly.
 
     HTML comments only (no real lessons) → treated as empty.
+
+    Kill switch: set HERMES_MEMORY_LESSONS_INJECT=0/false/off/no to
+    disable injection without touching any other pipeline component.
     """
+    # ── kill switch ──────────────────────────────────────────────────────
+    # Primary env var
+    _inject_enabled = os.environ.get("HERMES_MEMORY_LESSONS_INJECT")
+    # Deprecated fallback — will be removed in a future version
+    if _inject_enabled is None:
+        _deprecated = os.environ.get("HERMESMEMORYLESSONS_INJECT")
+        if _deprecated is not None:
+            logger.warning(
+                "[hermes-memory] HERMESMEMORYLESSONS_INJECT is deprecated; "
+                "use HERMES_MEMORY_LESSONS_INJECT. "
+                "Falling back to value=%s", _deprecated,
+            )
+            _inject_enabled = _deprecated
+    # Oldest deprecated fallback
+    if _inject_enabled is None:
+        _oldest = os.environ.get("HERMESMEMORYLESSONSINJECT")
+        if _oldest is not None:
+            logger.warning(
+                "[hermes-memory] HERMESMEMORYLESSONSINJECT is deprecated; "
+                "use HERMES_MEMORY_LESSONS_INJECT. "
+                "Falling back to value=%s", _oldest,
+            )
+            _inject_enabled = _oldest
+    # Default: enabled
+    if _inject_enabled is None:
+        _inject_enabled = "1"
+    if _inject_enabled.lower() in ("0", "false", "off", "no"):
+        logger.info(
+            "[hermes-memory] active_lessons injection disabled via "
+            "HERMES_MEMORY_LESSONS_INJECT=%s", _inject_enabled,
+        )
+        return None
+
     try:
         if not _ACTIVE_LESSONS_PATH.is_file():
             logger.debug("[hermes-memory] active_lessons.md not found — skip injection")

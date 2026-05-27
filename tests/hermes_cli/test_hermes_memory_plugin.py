@@ -160,6 +160,123 @@ class TestPreLlmCall:
         assert "Real Lesson" in result["context"]
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# P4B kill switch: HERMES_MEMORY_LESSONS_INJECT
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestKillSwitch:
+    """HERMES_MEMORY_LESSONS_INJECT kill switch — P4B."""
+
+    def test_default_unset_injects(self, monkeypatch, tmp_path):
+        """Env var not set → default enabled → inject."""
+        monkeypatch.delenv("HERMES_MEMORY_LESSONS_INJECT", raising=False)
+        p = tmp_path / "lessons.md"
+        p.write_text("P4B_SMOKE: default inject works.")
+        monkeypatch.setattr(_plugin, "_ACTIVE_LESSONS_PATH", p)
+        result = _inject_active_lessons(session_id="test")
+        assert result is not None
+        assert "P4B_SMOKE" in result["context"]
+
+    def test_env_1_injects(self, monkeypatch, tmp_path):
+        """HERMES_MEMORY_LESSONS_INJECT=1 → inject."""
+        monkeypatch.setenv("HERMES_MEMORY_LESSONS_INJECT", "1")
+        p = tmp_path / "lessons.md"
+        p.write_text("P4B: explicit enable works.")
+        monkeypatch.setattr(_plugin, "_ACTIVE_LESSONS_PATH", p)
+        result = _inject_active_lessons(session_id="test")
+        assert result is not None
+
+    def test_env_0_no_inject(self, monkeypatch, tmp_path):
+        """HERMES_MEMORY_LESSONS_INJECT=0 → no injection."""
+        monkeypatch.setenv("HERMES_MEMORY_LESSONS_INJECT", "0")
+        p = tmp_path / "lessons.md"
+        p.write_text("P4B: should not be injected.")
+        monkeypatch.setattr(_plugin, "_ACTIVE_LESSONS_PATH", p)
+        result = _inject_active_lessons(session_id="test")
+        assert result is None
+
+    def test_env_false_no_inject(self, monkeypatch, tmp_path):
+        """HERMES_MEMORY_LESSONS_INJECT=false → no injection."""
+        monkeypatch.setenv("HERMES_MEMORY_LESSONS_INJECT", "false")
+        p = tmp_path / "lessons.md"
+        p.write_text("P4B: should not be injected.")
+        monkeypatch.setattr(_plugin, "_ACTIVE_LESSONS_PATH", p)
+        result = _inject_active_lessons(session_id="test")
+        assert result is None
+
+    def test_env_off_no_inject(self, monkeypatch, tmp_path):
+        """HERMES_MEMORY_LESSONS_INJECT=off → no injection."""
+        monkeypatch.setenv("HERMES_MEMORY_LESSONS_INJECT", "off")
+        p = tmp_path / "lessons.md"
+        p.write_text("P4B: should not be injected.")
+        monkeypatch.setattr(_plugin, "_ACTIVE_LESSONS_PATH", p)
+        result = _inject_active_lessons(session_id="test")
+        assert result is None
+
+    def test_env_no_no_inject(self, monkeypatch, tmp_path):
+        """HERMES_MEMORY_LESSONS_INJECT=no → no injection."""
+        monkeypatch.setenv("HERMES_MEMORY_LESSONS_INJECT", "no")
+        p = tmp_path / "lessons.md"
+        p.write_text("P4B: should not be injected.")
+        monkeypatch.setattr(_plugin, "_ACTIVE_LESSONS_PATH", p)
+        result = _inject_active_lessons(session_id="test")
+        assert result is None
+
+    def test_env_0_post_llm_call_still_works(self, monkeypatch, tmp_path):
+        """Kill switch only affects pre_llm_call, not post_llm_call recording."""
+        monkeypatch.setenv("HERMES_MEMORY_LESSONS_INJECT", "0")
+        p = tmp_path / "lessons.md"
+        p.write_text("P4B: should not be injected.")
+        monkeypatch.setattr(_plugin, "_ACTIVE_LESSONS_PATH", p)
+        # pre_llm_call must return None
+        pre_result = _inject_active_lessons(session_id="test")
+        assert pre_result is None
+        # post_llm_call must still record
+        events_dir = tmp_path / "events"
+        candidates = events_dir / "event_candidates.jsonl"
+        monkeypatch.setattr(_plugin, "_EVENTS_DIR", events_dir)
+        monkeypatch.setattr(_plugin, "_EVENT_CANDIDATES_PATH", candidates)
+        _record_candidate(
+            session_id="s_kill",
+            user_message="不对，这个不对",
+            assistant_response="修复失败",
+        )
+        assert candidates.is_file(), "post_llm_call must still write events"
+        records = [json.loads(l) for l in candidates.read_text().strip().split("\n") if l]
+        assert len(records) == 1
+
+    def test_deprecated_old_name_fallback(self, monkeypatch, tmp_path):
+        """HERMESMEMORYLESSONS_INJECT (deprecated) → still works, logs warning."""
+        monkeypatch.delenv("HERMES_MEMORY_LESSONS_INJECT", raising=False)
+        monkeypatch.setenv("HERMESMEMORYLESSONS_INJECT", "0")
+        p = tmp_path / "lessons.md"
+        p.write_text("P4B: deprecated fallback test.")
+        monkeypatch.setattr(_plugin, "_ACTIVE_LESSONS_PATH", p)
+        result = _inject_active_lessons(session_id="test")
+        assert result is None, "deprecated var should still disable injection"
+
+    def test_deprecated_loses_to_primary(self, monkeypatch, tmp_path):
+        """Primary HERMES_MEMORY_LESSONS_INJECT=1 overrides deprecated=0."""
+        monkeypatch.setenv("HERMES_MEMORY_LESSONS_INJECT", "1")
+        monkeypatch.setenv("HERMESMEMORYLESSONS_INJECT", "0")
+        p = tmp_path / "lessons.md"
+        p.write_text("P4B: primary wins.")
+        monkeypatch.setattr(_plugin, "_ACTIVE_LESSONS_PATH", p)
+        result = _inject_active_lessons(session_id="test")
+        assert result is not None, "primary var must take precedence over deprecated"
+
+    def test_deprecated_oldest_name_fallback(self, monkeypatch, tmp_path):
+        """HERMESMEMORYLESSONSINJECT (oldest deprecated) → still works."""
+        monkeypatch.delenv("HERMES_MEMORY_LESSONS_INJECT", raising=False)
+        monkeypatch.delenv("HERMESMEMORYLESSONS_INJECT", raising=False)
+        monkeypatch.setenv("HERMESMEMORYLESSONSINJECT", "0")
+        p = tmp_path / "lessons.md"
+        p.write_text("P4B: oldest deprecated fallback test.")
+        monkeypatch.setattr(_plugin, "_ACTIVE_LESSONS_PATH", p)
+        result = _inject_active_lessons(session_id="test")
+        assert result is None, "oldest deprecated var should still disable injection"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # post_llm_call: event candidate recording
 # ══════════════════════════════════════════════════════════════════════════════
