@@ -43,6 +43,7 @@ _USER_CORRECTION_PATTERNS = (
 # ── failure keywords (assistant_response) ──────────────────────────────────
 _ASSISTANT_FAILURE_PATTERNS = (
     "失败", "不通过", "error", "exception", "traceback", "无法",
+    "超时", "timed out", "timeout",
 )
 
 
@@ -317,31 +318,82 @@ def _record_candidate(
 # ── P5A: shadow pipeline throttle ──────────────────────────────────────────
 _PIPELINE_PID_FILE = _MEMORY_DIR / ".pipeline_running"
 _PIPELINE_COOLDOWN_SEC = 30  # prevent back-to-back triggers
+_PIPELINE_MAX_LOCK_AGE_SEC = 300  # 5 min — lock older than this is stale regardless
+
+
+def _check_stale_lock() -> bool:
+    """Return True if the lock file should be treated as stale (blocking).
+
+    Checks in order:
+    1. PID in file exists? → active → NOT stale (don't touch)
+    2. PID dead but lock fresh? → may be race → NOT stale (log warning, skip)
+    3. PID dead + lock old? → stale → clean lock file
+    4. Can't read PID / malformed? → log warning → NOT stale
+    """
+    if not _PIPELINE_PID_FILE.is_file():
+        return False
+
+    try:
+        pid_str = _PIPELINE_PID_FILE.read_text().strip()
+        if not pid_str:
+            logger.warning("[hermes-memory] .pipeline_running empty — treating as stale")
+            _PIPELINE_PID_FILE.unlink(missing_ok=True)
+            return False
+
+        pid = int(pid_str)
+        age = time.time() - _PIPELINE_PID_FILE.stat().st_mtime
+
+        # Check if process exists
+        import os as _os_module
+        try:
+            _os_module.kill(pid, 0)  # signal 0 = existence check only
+        except (ProcessLookupError, PermissionError):
+            # PID is dead
+            if age > _PIPELINE_MAX_LOCK_AGE_SEC:
+                logger.info(
+                    "[hermes-memory] stale pipeline lock detected — pid=%d dead, age=%ds > %ds threshold. Cleaning.",
+                    pid, int(age), _PIPELINE_MAX_LOCK_AGE_SEC,
+                )
+                _PIPELINE_PID_FILE.unlink(missing_ok=True)
+                return False
+            else:
+                logger.warning(
+                    "[hermes-memory] pipeline lock pid=%d is dead but lock only %ds old (< %ds). "
+                    "Possible race — skipping trigger to be safe.",
+                    pid, int(age), _PIPELINE_MAX_LOCK_AGE_SEC,
+                )
+                return True  # block — unsafe to clear fresh lock
+
+        # PID is alive — lock is valid
+        logger.debug("[hermes-memory] pipeline pid=%d is alive — lock valid", pid)
+        return True
+
+    except (ValueError, OSError) as exc:
+        logger.warning(
+            "[hermes-memory] cannot parse .pipeline_running pid: %s — skipping trigger", exc,
+        )
+        return True  # can't determine → block
 
 
 def _maybe_trigger_shadow_pipeline(reason: str) -> None:
     """Trigger memory_pipeline in shadow/dry-run mode after recording an event.
 
     Gating:
+    - Stale lock detection: PID alive/dead check before cleanup (P5Z-fix).
     - Throttle: skip if pipeline ran within _PIPELINE_COOLDOWN_SEC seconds.
     - Lock: skip if another pipeline is already running (pid file).
     - Failure here must NEVER impact the main reply.
     """
     try:
-        # ── throttle check ────────────────────────────────────────────
-        if _PIPELINE_PID_FILE.is_file():
-            try:
-                age = time.time() - _PIPELINE_PID_FILE.stat().st_mtime
-                if age < _PIPELINE_COOLDOWN_SEC:
-                    logger.info(
-                        "[hermes-memory] pipeline cooldown active (%.0fs < %ds) — skip trigger",
-                        age, _PIPELINE_COOLDOWN_SEC,
-                    )
-                    return
-            except OSError:
-                pass
+        # ── stale lock check ─────────────────────────────────────────
+        if _check_stale_lock():
+            logger.info(
+                "[hermes-memory] pipeline lock active or undetermined — skip trigger reason=%s",
+                reason,
+            )
+            return
 
-        # Touch pid file to set cooldown
+        # Touch pid file to set lock
         _PIPELINE_PID_FILE.write_text(str(os.getpid()))
 
         # ── resolve pipeline script path ─────────────────────────────

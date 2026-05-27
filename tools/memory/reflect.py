@@ -144,19 +144,59 @@ def _lesson_from_event(event: dict) -> dict:
             "lesson": "When a task cannot be completed, explain why and suggest alternatives. Do not silently give up.",
             "confidence": "medium",
         },
+        "assistant_failure:timeout": {
+            "issue": "A tool call or model request timed out",
+            "lesson": "Timeouts require retry with fallback or timeout increase. Do not retry indefinitely — set max retries and escalate after exhausting.",
+            "confidence": "medium",
+            "evidence": "Assistant response contains timeout/timeout error message",
+            "root_cause": "Subprocess, API, or model call exceeded allowed time limit",
+            "correct_rule": "After a timeout, retry with exponential backoff (max 3). If all fail, report failure with details — do not silently proceed.",
+            "do_not_repeat": "Retrying the same operation without adjusting timeout or adding fallback logic",
+            "applies_when": "When tool calls / network requests / model APIs return timeout errors",
+            "does_not_apply_when": "When user mentions 'timeout' or '超时' in a question or comment — only assistant-side timeouts count",
+            "next_action": "Audit the failed operation for root cause: network, overload, or timeout too conservative",
+        },
+        "assistant_failure:超时": {
+            "issue": "A tool call or model request timed out (Chinese timeout)",
+            "lesson": "Timeouts require retry with fallback or timeout increase. Do not retry indefinitely.",
+            "confidence": "medium",
+            "evidence": "Assistant response contains 超时/超时错误",
+            "root_cause": "Subprocess, API, or model call exceeded allowed time limit",
+            "correct_rule": "After a timeout, retry with exponential backoff (max 3). If all fail, report failure with details.",
+            "do_not_repeat": "Retrying the same operation without adjusting timeout or adding fallback logic",
+            "applies_when": "When tool calls / network requests / model APIs return 超时 errors",
+            "does_not_apply_when": "When user mentions '超时' in a question — only assistant-side timeouts count",
+            "next_action": "Audit the failed operation for root cause: network, overload, or timeout too conservative",
+        },
     }
 
     entry = lesson_map.get(reason, {
         "issue": f"Unknown trigger: {reason}",
         "lesson": f"Review and document the pattern for trigger: {reason}",
         "confidence": "low",
+        "evidence": f"Trigger reason: {reason}",
+        "root_cause": f"Unmapped trigger: {reason} — needs manual review",
+        "correct_rule": "Review and document this trigger pattern",
+        "do_not_repeat": f"Blindly handling trigger: {reason} without root cause analysis",
+        "applies_when": f"When trigger '{reason}' is detected",
+        "does_not_apply_when": "When the same text appears in user chat (not failure output)",
+        "next_action": f"Add explicit mapping for trigger: {reason} in _lesson_from_event",
     })
 
-    return {
+    # Build enhanced result with schema fields (P5Z-fix)
+    result = {
         "issue": entry["issue"],
         "lesson": entry["lesson"],
         "confidence": entry["confidence"],
+        "evidence": entry.get("evidence", f"Trigger reason: {reason}"),
+        "root_cause": entry.get("root_cause", f"Failure type: {reason}"),
+        "correct_rule": entry.get("correct_rule", entry.get("lesson", "")),
+        "do_not_repeat": entry.get("do_not_repeat", "Repeating the same error without correction"),
+        "applies_when": entry.get("applies_when", f"When {reason} is detected in assistant output"),
+        "does_not_apply_when": entry.get("does_not_apply_when", "When the text is in user chat, not failure output"),
+        "next_action": entry.get("next_action", "Verify the lesson in next turn and adjust if needed"),
     }
+    return result
 
 
 def _write_reflection(event: dict, lesson: dict, apply: bool = False) -> Path | None:
@@ -177,6 +217,13 @@ session_id: {event.get("session_id", "")}
 created_at: {datetime.now(timezone.utc).isoformat()}
 confidence: {lesson["confidence"]}
 source_type: event_candidate
+evidence: {_safe_excerpt(lesson.get("evidence", ""), _MAX_EXCERPT_CHARS)}
+root_cause: {_safe_excerpt(lesson.get("root_cause", ""), _MAX_EXCERPT_CHARS)}
+correct_rule: {_safe_excerpt(lesson.get("correct_rule", ""), _MAX_EXCERPT_CHARS)}
+do_not_repeat: {_safe_excerpt(lesson.get("do_not_repeat", ""), _MAX_EXCERPT_CHARS)}
+applies_when: {_safe_excerpt(lesson.get("applies_when", ""), _MAX_EXCERPT_CHARS)}
+does_not_apply_when: {_safe_excerpt(lesson.get("does_not_apply_when", ""), _MAX_EXCERPT_CHARS)}
+next_action: {_safe_excerpt(lesson.get("next_action", ""), _MAX_EXCERPT_CHARS)}
 ---
 
 # Reflection: {reason}
@@ -189,6 +236,27 @@ source_type: event_candidate
 
 ## assistant_response_excerpt
 {_safe_excerpt(event.get("assistant_response_excerpt", ""))}
+
+## evidence
+{lesson.get("evidence", "N/A")}
+
+## root_cause
+{lesson.get("root_cause", "N/A")}
+
+## correct_rule
+{lesson.get("correct_rule", lesson.get("lesson", "N/A"))}
+
+## do_not_repeat
+{lesson.get("do_not_repeat", "N/A")}
+
+## applies_when
+{lesson.get("applies_when", "N/A")}
+
+## does_not_apply_when
+{lesson.get("does_not_apply_when", "N/A")}
+
+## next_action
+{lesson.get("next_action", "N/A")}
 
 ## likely_lesson
 {lesson["lesson"]}
