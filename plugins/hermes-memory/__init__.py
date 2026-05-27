@@ -333,7 +333,7 @@ def _maybe_trigger_shadow_pipeline(reason: str) -> None:
             try:
                 age = time.time() - _PIPELINE_PID_FILE.stat().st_mtime
                 if age < _PIPELINE_COOLDOWN_SEC:
-                    logger.debug(
+                    logger.info(
                         "[hermes-memory] pipeline cooldown active (%.0fs < %ds) — skip trigger",
                         age, _PIPELINE_COOLDOWN_SEC,
                     )
@@ -344,13 +344,19 @@ def _maybe_trigger_shadow_pipeline(reason: str) -> None:
         # Touch pid file to set cooldown
         _PIPELINE_PID_FILE.write_text(str(os.getpid()))
 
-        # ── run pipeline shadow mode ──────────────────────────────────
-        pipeline_script = str(
-            Path(__file__).resolve().parent.parent.parent
-            / "tools" / "memory" / "memory_pipeline.py"
+        # ── resolve pipeline script path ─────────────────────────────
+        _repo_root = Path(
+            os.environ.get(
+                "HERMES_AGENT_REPO",
+                str(Path.home() / ".hermes" / "hermes-agent"),
+            )
         )
+        pipeline_script = str(_repo_root / "tools" / "memory" / "memory_pipeline.py")
         if not Path(pipeline_script).is_file():
-            logger.debug("[hermes-memory] pipeline script not found — skip trigger")
+            logger.warning(
+                "[hermes-memory] pipeline script not found at %s — skip trigger",
+                pipeline_script,
+            )
             return
 
         result = _run_subprocess(
