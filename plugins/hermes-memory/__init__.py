@@ -43,8 +43,9 @@ _USER_CORRECTION_PATTERNS = (
 # ── failure keywords (assistant_response) ──────────────────────────────────
 _ASSISTANT_FAILURE_PATTERNS = (
     "失败", "不通过", "error", "exception", "traceback", "无法",
-    "超时", "timed out", "timeout",
+    "超时", "timed out",
 )
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
